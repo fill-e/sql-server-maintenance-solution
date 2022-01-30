@@ -36,7 +36,7 @@ DECLARE @BackupDirectory nvarchar(max)     = NULL        -- Specify the backup r
 DECLARE @CleanupTime int                   = NULL        -- Time in hours, after which backup files are deleted. If no time is specified, then no backup files are deleted.
 DECLARE @OutputFileDirectory nvarchar(max) = NULL        -- Specify the output file directory. If no directory is specified, then the SQL Server error log directory is used.
 DECLARE @LogToTable nvarchar(max)          = 'Y'         -- Log commands to a table.
-DECLARE @S3BucketArn nvarchar(255) = 'arn:aws:s3:::aws-rds-sql-s3'                -- AWS S3 Bucket ARN value.
+DECLARE @S3BucketArn nvarchar(255) = NULL                -- AWS S3 Bucket ARN value.
 
 DECLARE @ErrorMessage nvarchar(max)
 
