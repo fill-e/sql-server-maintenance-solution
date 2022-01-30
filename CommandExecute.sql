@@ -2,11 +2,13 @@
 GO
 SET QUOTED_IDENTIFIER ON
 GO
+
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[CommandExecute]') AND type in (N'P', N'PC'))
 BEGIN
 EXEC dbo.sp_executesql @statement = N'CREATE PROCEDURE [dbo].[CommandExecute] AS'
 END
 GO
+
 ALTER PROCEDURE [dbo].[CommandExecute]
 
 @DatabaseContext nvarchar(max),
@@ -37,6 +39,8 @@ BEGIN
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
   --// Version: 2022-01-02 13:58:13                                                               //--
+  --// Forked:  https://github.com/fill-e/sql-server-maintenance-solution                         //--
+  --// Version: 2022-01-29                                                                        //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -69,6 +73,24 @@ BEGIN
   DECLARE @EmptyLine nvarchar(max) = CHAR(9)
 
   DECLARE @RevertCommand nvarchar(max)
+
+  DECLARE @AmazonRDS bit = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
+  DECLARE @task_id INT
+
+  DECLARE @RDSQueue TABLE ([task_id] INT,
+							[task_type] nvarchar(max),
+							[database_name] nvarchar(max),
+							[% complete] nvarchar(max),
+							[duration (mins)] nvarchar(max),
+							[lifecycle] nvarchar(max),
+							[task_info] nvarchar(max),
+							[last_updated] nvarchar(max),
+							[created_at] nvarchar(max),
+							[S3_object_arn] nvarchar(max),
+							[overwrite_s3_backup_file] nvarchar(max),
+							[KMS_master_key_arn] nvarchar(max),
+							[filepath] nvarchar(max),
+							[overwrite_file] BIT)
 
   ----------------------------------------------------------------------------------------------------
   --// Check core requirements                                                                    //--
@@ -185,7 +207,6 @@ BEGIN
   IF @ExecuteAsUser IS NOT NULL
   BEGIN
     SET @Command = 'EXECUTE AS USER = ''' + REPLACE(@ExecuteAsUser,'''','''''') + '''; ' + @Command + '; REVERT;'
-
     SET @RevertCommand = 'REVERT'
   END
 
@@ -224,9 +245,37 @@ BEGIN
 
   IF @Mode = 1 AND @Execute = 'Y'
   BEGIN
-    EXECUTE @sp_executesql @stmt = @Command
-    SET @Error = @@ERROR
-    SET @ReturnCode = @Error
+    IF @AmazonRDS = 1
+	BEGIN
+      BEGIN TRY
+        EXECUTE @sp_executesql @stmt = @Command
+	  	INSERT INTO @RDSQueue exec msdb..rds_task_status @db_name=@DatabaseName;
+	    SELECT TOP 1 @task_id=task_id from @RDSQueue ORDER BY task_id DESC
+	    INSERT INTO dbo.RDS_BackupLog (ID, task_id, [Status]) VALUES (@ID, @task_id, 'CREATED')
+      END TRY
+      BEGIN CATCH
+        SET @Error = ERROR_NUMBER()
+        SET @ErrorMessageOriginal = ERROR_MESSAGE()
+		  BEGIN
+		  	SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
+
+            SET @Severity = CASE WHEN ERROR_NUMBER() IN(1205,1222) THEN @LockMessageSeverity ELSE 16 END
+			IF @ErrorMessageOriginal NOT LIKE 'A task has already been issued for database: %' 
+			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH LOG
+			ELSE
+			BEGIN
+			  SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
+			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH NOWAIT
+			END
+		  END
+      END CATCH
+    END
+	ELSE
+	BEGIN
+      EXECUTE @sp_executesql @stmt = @Command
+      SET @Error = @@ERROR
+	  SET @ReturnCode = @Error
+	END
   END
 
   IF @Mode = 2 AND @Execute = 'Y'
@@ -287,7 +336,6 @@ BEGIN
   END
 
   ----------------------------------------------------------------------------------------------------
-
 END
-GO
+
 

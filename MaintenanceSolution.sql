@@ -17,9 +17,17 @@ You can contact me by e-mail at ola@hallengren.com.
 Ola Hallengren
 https://ola.hallengren.com
 
+Forked to support AWS RDS for SQL Server  
+	https://github.com/fill-e/sql-server-maintenance-solution   
+    Version: 2022-01-29        
+
 */
 
-USE [master] -- Specify the database in which the objects will be created.
+IF NOT EXISTS (SELECT 1 FROM master.sys.databases WHERE Name = 'dba')
+	CREATE DATABASE [dba]
+GO
+	
+USE [dba] -- Specify the database in which the objects will be created.
 
 SET NOCOUNT ON
 
@@ -28,6 +36,7 @@ DECLARE @BackupDirectory nvarchar(max)     = NULL        -- Specify the backup r
 DECLARE @CleanupTime int                   = NULL        -- Time in hours, after which backup files are deleted. If no time is specified, then no backup files are deleted.
 DECLARE @OutputFileDirectory nvarchar(max) = NULL        -- Specify the output file directory. If no directory is specified, then the SQL Server error log directory is used.
 DECLARE @LogToTable nvarchar(max)          = 'Y'         -- Log commands to a table.
+DECLARE @S3BucketArn nvarchar(255) = 'arn:aws:s3:::aws-rds-sql-s3'                -- AWS S3 Bucket ARN value.
 
 DECLARE @ErrorMessage nvarchar(max)
 
@@ -53,6 +62,7 @@ INSERT INTO #Config ([Name], [Value]) VALUES('BackupDirectory', @BackupDirectory
 INSERT INTO #Config ([Name], [Value]) VALUES('CleanupTime', @CleanupTime)
 INSERT INTO #Config ([Name], [Value]) VALUES('OutputFileDirectory', @OutputFileDirectory)
 INSERT INTO #Config ([Name], [Value]) VALUES('LogToTable', @LogToTable)
+INSERT INTO #Config ([Name], [Value]) VALUES('S3BucketArn', @S3BucketArn)
 INSERT INTO #Config ([Name], [Value]) VALUES('DatabaseName', DB_NAME(DB_ID()))
 GO
 SET ANSI_NULLS ON
@@ -89,11 +99,31 @@ SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[RDS_BackupLog]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[RDS_BackupLog](
+	[ID] [int] NOT NULL,
+	[task_id] [int] NOT NULL,
+	[Status] [nvarchar](max) NULL,
+	[task_Info] [nvarchar](max) NULL,
+   CONSTRAINT [PK_RDS_BackupLog] PRIMARY KEY CLUSTERED 
+(
+	[ID] ASC, [task_id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON)
+) 
+END
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[CommandExecute]') AND type in (N'P', N'PC'))
 BEGIN
 EXEC dbo.sp_executesql @statement = N'CREATE PROCEDURE [dbo].[CommandExecute] AS'
 END
 GO
+
 ALTER PROCEDURE [dbo].[CommandExecute]
 
 @DatabaseContext nvarchar(max),
@@ -124,6 +154,8 @@ BEGIN
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
   --// Version: 2022-01-02 13:58:13                                                               //--
+  --// Forked:  https://github.com/fill-e/sql-server-maintenance-solution                         //--
+  --// Version: 2022-01-29                                                                        //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -156,6 +188,24 @@ BEGIN
   DECLARE @EmptyLine nvarchar(max) = CHAR(9)
 
   DECLARE @RevertCommand nvarchar(max)
+
+  DECLARE @AmazonRDS bit = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
+  DECLARE @task_id INT
+
+  DECLARE @RDSQueue TABLE ([task_id] INT,
+							[task_type] nvarchar(max),
+							[database_name] nvarchar(max),
+							[% complete] nvarchar(max),
+							[duration (mins)] nvarchar(max),
+							[lifecycle] nvarchar(max),
+							[task_info] nvarchar(max),
+							[last_updated] nvarchar(max),
+							[created_at] nvarchar(max),
+							[S3_object_arn] nvarchar(max),
+							[overwrite_s3_backup_file] nvarchar(max),
+							[KMS_master_key_arn] nvarchar(max),
+							[filepath] nvarchar(max),
+							[overwrite_file] BIT)
 
   ----------------------------------------------------------------------------------------------------
   --// Check core requirements                                                                    //--
@@ -272,7 +322,6 @@ BEGIN
   IF @ExecuteAsUser IS NOT NULL
   BEGIN
     SET @Command = 'EXECUTE AS USER = ''' + REPLACE(@ExecuteAsUser,'''','''''') + '''; ' + @Command + '; REVERT;'
-
     SET @RevertCommand = 'REVERT'
   END
 
@@ -311,9 +360,37 @@ BEGIN
 
   IF @Mode = 1 AND @Execute = 'Y'
   BEGIN
-    EXECUTE @sp_executesql @stmt = @Command
-    SET @Error = @@ERROR
-    SET @ReturnCode = @Error
+    IF @AmazonRDS = 1
+	BEGIN
+      BEGIN TRY
+        EXECUTE @sp_executesql @stmt = @Command
+	  	INSERT INTO @RDSQueue exec msdb..rds_task_status @db_name=@DatabaseName;
+	    SELECT TOP 1 @task_id=task_id from @RDSQueue ORDER BY task_id DESC
+	    INSERT INTO dbo.RDS_BackupLog (ID, task_id, [Status]) VALUES (@ID, @task_id, 'CREATED')
+      END TRY
+      BEGIN CATCH
+        SET @Error = ERROR_NUMBER()
+        SET @ErrorMessageOriginal = ERROR_MESSAGE()
+		  BEGIN
+		  	SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
+
+            SET @Severity = CASE WHEN ERROR_NUMBER() IN(1205,1222) THEN @LockMessageSeverity ELSE 16 END
+			IF @ErrorMessageOriginal NOT LIKE 'A task has already been issued for database: %' 
+			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH LOG
+			ELSE
+			BEGIN
+			  SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
+			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH NOWAIT
+			END
+		  END
+      END CATCH
+    END
+	ELSE
+	BEGIN
+      EXECUTE @sp_executesql @stmt = @Command
+      SET @Error = @@ERROR
+	  SET @ReturnCode = @Error
+	END
   END
 
   IF @Mode = 2 AND @Execute = 'Y'
@@ -374,8 +451,9 @@ BEGIN
   END
 
   ----------------------------------------------------------------------------------------------------
-
 END
+
+
 GO
 SET ANSI_NULLS ON
 GO
@@ -448,8 +526,9 @@ ALTER PROCEDURE [dbo].[DatabaseBackup]
 @StringDelimiter nvarchar(max) = ',',
 @DatabaseOrder nvarchar(max) = NULL,
 @DatabasesInParallel nvarchar(max) = 'N',
+@S3BucketArn nvarchar(255) = NULL,
 @LogToTable nvarchar(max) = 'N',
-@Execute nvarchar(max) = 'Y'
+@Execute nvarchar(max) = 'Y'					   
 
 AS
 
@@ -460,6 +539,8 @@ BEGIN
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
   --// Version: 2022-01-02 13:58:13                                                               //--
+  --// Forked:  https://github.com/fill-e/sql-server-maintenance-solution                         //--
+  --// Version: 2022-01-29                                                                        //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -635,6 +716,11 @@ BEGIN
 
   DECLARE @Version numeric(18,10) = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
+  DECLARE @CurrentRDSBackupType nvarchar(20)
+  DECLARE @CurrentRDSDatabaseFileName nvarchar(4000)
+
+  DECLARE @ServerName nvarchar(max) = CASE WHEN SERVERPROPERTY('EngineEdition') = 8 THEN LEFT(CAST(SERVERPROPERTY('ServerName') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ServerName') AS nvarchar(max))) - 1) ELSE CAST(SERVERPROPERTY('MachineName') AS nvarchar(max)) END											
+  
   IF @Version >= 14
   BEGIN
     SELECT @HostPlatform = host_platform
@@ -801,11 +887,11 @@ BEGIN
     SELECT 'The transaction count is not 0.', 16, 1
   END
 
-  IF @AmazonRDS = 1
-  BEGIN
-    INSERT INTO @Errors ([Message], Severity, [State])
-    SELECT 'The stored procedure DatabaseBackup is not supported on Amazon RDS.', 16, 1
-  END
+  ---IF @AmazonRDS = 1
+  ---BEGIN
+ ----   INSERT INTO @Errors ([Message], Severity, [State])
+ ---   SELECT 'The stored procedure DatabaseBackup is not supported on Amazon RDS.', 16, 1
+  ---END
 
   ----------------------------------------------------------------------------------------------------
   --// Select databases                                                                           //--
@@ -1256,6 +1342,8 @@ BEGIN
         BREAK
       END
 
+	IF @AmazonRDS = 0
+	  BEGIN				
       INSERT INTO @DirectoryInfo (FileExists, FileIsADirectory, ParentDirectoryExists)
       EXECUTE [master].dbo.xp_fileexist @CurrentRootDirectoryPath
 
@@ -1264,6 +1352,7 @@ BEGIN
         INSERT INTO @Errors ([Message], Severity, [State])
         SELECT 'The directory ' + @CurrentRootDirectoryPath + ' does not exist.', 16, 1
       END
+	END  
 
       UPDATE @Directories
       SET Completed = 1
@@ -3112,15 +3201,18 @@ BEGIN
     FROM sys.database_mirroring
     WHERE database_id = DB_ID(@CurrentDatabaseName)
 
-    IF EXISTS (SELECT * FROM msdb.dbo.log_shipping_primary_databases WHERE primary_database = @CurrentDatabaseName)
+	IF @AmazonRDS = 0
     BEGIN
-      SET @CurrentLogShippingRole = 'PRIMARY'
-    END
-    ELSE
-    IF EXISTS (SELECT * FROM msdb.dbo.log_shipping_secondary_databases WHERE secondary_database = @CurrentDatabaseName)
-    BEGIN
-      SET @CurrentLogShippingRole = 'SECONDARY'
-    END
+	  IF EXISTS (SELECT * FROM msdb.dbo.log_shipping_primary_databases WHERE primary_database = @CurrentDatabaseName)
+      BEGIN
+		SET @CurrentLogShippingRole = 'PRIMARY'
+	  END
+	  ELSE
+	  IF EXISTS (SELECT * FROM msdb.dbo.log_shipping_secondary_databases WHERE secondary_database = @CurrentDatabaseName)
+	  BEGIN
+		SET @CurrentLogShippingRole = 'SECONDARY'
+	  END
+	END
 
     IF @CurrentIsDatabaseAccessible IS NOT NULL
     BEGIN
@@ -3714,6 +3806,7 @@ BEGIN
       -- Create directory
       IF @HostPlatform = 'Windows'
       AND (@BackupSoftware <> 'DATA_DOMAIN_BOOST' OR @BackupSoftware IS NULL)
+		AND (@AmazonRDS = 0) 				
       AND NOT EXISTS(SELECT * FROM @CurrentDirectories WHERE DirectoryPath = 'NUL' OR DirectoryPath IN(SELECT DirectoryPath FROM @Directories))
       BEGIN
         WHILE (1 = 1)
@@ -3866,71 +3959,98 @@ BEGIN
       END
 
       -- Perform a backup
-      IF NOT EXISTS (SELECT * FROM @CurrentDirectories WHERE DirectoryPath <> 'NUL' AND DirectoryPath NOT IN(SELECT DirectoryPath FROM @Directories) AND (CreateOutput <> 0 OR CreateOutput IS NULL))
-      OR @HostPlatform = 'Linux'
+      IF NOT EXISTS (SELECT * FROM @CurrentDirectories WHERE DirectoryPath <> 'NUL' AND DirectoryPath NOT IN(SELECT DirectoryPath FROM @Directories) AND (CreateOutput <> 0 OR CreateOutput IS NULL))  OR @HostPlatform = 'Linux' OR @AmazonRDS = 1
       BEGIN
         IF @BackupSoftware IS NULL
-        BEGIN
-          SET @CurrentDatabaseContext = 'master'
+		BEGIN
+		  IF @AmazonRDS = 1
+	        BEGIN
+			  SET @CurrentDatabaseContext = 'master'
 
-          SELECT @CurrentCommandType = CASE
-          WHEN @CurrentBackupType IN('DIFF','FULL') THEN 'BACKUP_DATABASE'
-          WHEN @CurrentBackupType = 'LOG' THEN 'BACKUP_LOG'
-          END
+			  SELECT @CurrentCommandType = CASE
+				WHEN @CurrentBackupType IN('DIFF','FULL') THEN 'BACKUP_DATABASE'
+			  END
 
-          SELECT @CurrentCommand = CASE
-          WHEN @CurrentBackupType IN('DIFF','FULL') THEN 'BACKUP DATABASE ' + QUOTENAME(@CurrentDatabaseName)
-          WHEN @CurrentBackupType = 'LOG' THEN 'BACKUP LOG ' + QUOTENAME(@CurrentDatabaseName)
-          END
+			  SELECT @CurrentRDSBackupType = CASE
+			    WHEN @CurrentBackupType = 'DIFF' THEN 'DIFFERENTIAL'
+			    WHEN @CurrentBackupType = 'FULL' THEN 'FULL'
+			  END
 
-          IF @ReadWriteFileGroups = 'Y' AND @CurrentDatabaseName <> 'master' SET @CurrentCommand += ' READ_WRITE_FILEGROUPS'
+			  IF @CurrentNumberOfFiles > 10 SET @CurrentNumberOfFiles = 10
 
-          SET @CurrentCommand += ' TO'
+			  IF @CurrentAvailabilityGroup = Null 
+			    SET @CurrentDatabaseFileName = @ServerName + '/' + @CurrentDatabaseFileName
+			  ELSE
+			    SET @CurrentDatabaseFileName = @ServerName + '/' + @CurrentAvailabilityGroup + '/' + @CurrentDatabaseFileName
 
-          SELECT @CurrentCommand += ' ' + [Type] + ' = N''' + REPLACE(FilePath,'''','''''') + '''' + CASE WHEN ROW_NUMBER() OVER (ORDER BY FilePath ASC) <> @CurrentNumberOfFiles THEN ',' ELSE '' END
-          FROM @CurrentFiles
-          WHERE Mirror = 0
-          ORDER BY FilePath ASC
+			  IF @CurrentNumberOfFiles > 1
+			    SELECT @CurrentDatabaseFileName=REPLACE(@CurrentDatabaseFileName,'_{FileNumber}','*'); 
+			 
+			  SET @CurrentCommand = 'EXEC msdb.dbo.rds_backup_database 	@source_db_name = ' + QUOTENAME(@CurrentDatabaseName) + ', @s3_arn_to_backup_to = ' + '''' + @S3BucketArn + '/' + @CurrentDatabaseFileName + '''' + ', @overwrite_s3_backup_file=1 ' + ', @type=' + '''' + @CurrentRDSBackupType + '''' + ', @number_of_files= ' + CAST(@CurrentNumberOfFiles AS VarChar(2)) + ';'
+	        END
+		  ELSE
+            BEGIN
+			  SET @CurrentDatabaseContext = 'master'
 
-          IF EXISTS(SELECT * FROM @CurrentFiles WHERE Mirror = 1)
-          BEGIN
-            SET @CurrentCommand += ' MIRROR TO'
+			  SELECT @CurrentCommandType = CASE
+			  WHEN @CurrentBackupType IN('DIFF','FULL') THEN 'BACKUP_DATABASE'
+			  WHEN @CurrentBackupType = 'LOG' THEN 'BACKUP_LOG'
+			  END
 
-            SELECT @CurrentCommand += ' ' + [Type] + ' = N''' + REPLACE(FilePath,'''','''''') + '''' + CASE WHEN ROW_NUMBER() OVER (ORDER BY FilePath ASC) <> @CurrentNumberOfFiles THEN ',' ELSE '' END
-            FROM @CurrentFiles
-            WHERE Mirror = 1
-            ORDER BY FilePath ASC
-          END
+			  SELECT @CurrentCommand = CASE
+			  WHEN @CurrentBackupType IN('DIFF','FULL') THEN 'BACKUP DATABASE ' + QUOTENAME(@CurrentDatabaseName)
+			  WHEN @CurrentBackupType = 'LOG' THEN 'BACKUP LOG ' + QUOTENAME(@CurrentDatabaseName)
+			  END
 
-          SET @CurrentCommand += ' WITH '
-          IF @CheckSum = 'Y' SET @CurrentCommand += 'CHECKSUM'
-          IF @CheckSum = 'N' SET @CurrentCommand += 'NO_CHECKSUM'
+			  IF @ReadWriteFileGroups = 'Y' AND @CurrentDatabaseName <> 'master' SET @CurrentCommand += ' READ_WRITE_FILEGROUPS'
 
-          IF @Version >= 10
-          BEGIN
-            SET @CurrentCommand += CASE WHEN @Compress = 'Y' AND (@CurrentIsEncrypted = 0 OR (@CurrentIsEncrypted = 1 AND ((@Version >= 13 AND @CurrentMaxTransferSize >= 65537) OR @Version >= 15.0404316 OR SERVERPROPERTY('EngineEdition') = 8))) THEN ', COMPRESSION' ELSE ', NO_COMPRESSION' END
-          END
+			  SET @CurrentCommand += ' TO'
 
-          IF @CurrentBackupType = 'DIFF' SET @CurrentCommand += ', DIFFERENTIAL'
+			  SELECT @CurrentCommand += ' ' + [Type] + ' = N''' + REPLACE(FilePath,'''','''''') + '''' + CASE WHEN ROW_NUMBER() OVER (ORDER BY FilePath ASC) <> @CurrentNumberOfFiles THEN ',' ELSE '' END
+			  FROM @CurrentFiles
+			  WHERE Mirror = 0
+			  ORDER BY FilePath ASC
 
-          IF EXISTS(SELECT * FROM @CurrentFiles WHERE Mirror = 1)
-          BEGIN
-            SET @CurrentCommand += ', FORMAT'
-          END
+			  IF EXISTS(SELECT * FROM @CurrentFiles WHERE Mirror = 1)
+			  BEGIN
+				SET @CurrentCommand += ' MIRROR TO'
 
-          IF @CopyOnly = 'Y' SET @CurrentCommand += ', COPY_ONLY'
-          IF @NoRecovery = 'Y' AND @CurrentBackupType = 'LOG' SET @CurrentCommand += ', NORECOVERY'
-          IF @Init = 'Y' SET @CurrentCommand += ', INIT'
-          IF @Format = 'Y' SET @CurrentCommand += ', FORMAT'
-          IF @BlockSize IS NOT NULL SET @CurrentCommand += ', BLOCKSIZE = ' + CAST(@BlockSize AS nvarchar)
-          IF @BufferCount IS NOT NULL SET @CurrentCommand += ', BUFFERCOUNT = ' + CAST(@BufferCount AS nvarchar)
-          IF @CurrentMaxTransferSize IS NOT NULL SET @CurrentCommand += ', MAXTRANSFERSIZE = ' + CAST(@CurrentMaxTransferSize AS nvarchar)
-          IF @Description IS NOT NULL SET @CurrentCommand += ', DESCRIPTION = N''' + REPLACE(@Description,'''','''''') + ''''
-          IF @Encrypt = 'Y' SET @CurrentCommand += ', ENCRYPTION (ALGORITHM = ' + UPPER(@EncryptionAlgorithm) + ', '
-          IF @Encrypt = 'Y' AND @ServerCertificate IS NOT NULL SET @CurrentCommand += 'SERVER CERTIFICATE = ' + QUOTENAME(@ServerCertificate)
-          IF @Encrypt = 'Y' AND @ServerAsymmetricKey IS NOT NULL SET @CurrentCommand += 'SERVER ASYMMETRIC KEY = ' + QUOTENAME(@ServerAsymmetricKey)
-          IF @Encrypt = 'Y' SET @CurrentCommand += ')'
-          IF @URL IS NOT NULL AND @Credential IS NOT NULL SET @CurrentCommand += ', CREDENTIAL = N''' + REPLACE(@Credential,'''','''''') + ''''
+				SELECT @CurrentCommand += ' ' + [Type] + ' = N''' + REPLACE(FilePath,'''','''''') + '''' + CASE WHEN ROW_NUMBER() OVER (ORDER BY FilePath ASC) <> @CurrentNumberOfFiles THEN ',' ELSE '' END
+				FROM @CurrentFiles
+				WHERE Mirror = 1
+				ORDER BY FilePath ASC
+			  END
+
+			  SET @CurrentCommand += ' WITH '
+			  IF @CheckSum = 'Y' SET @CurrentCommand += 'CHECKSUM'
+			  IF @CheckSum = 'N' SET @CurrentCommand += 'NO_CHECKSUM'
+
+			  IF @Version >= 10
+			  BEGIN
+				SET @CurrentCommand += CASE WHEN @Compress = 'Y' AND (@CurrentIsEncrypted = 0 OR (@CurrentIsEncrypted = 1 AND ((@Version >= 13 AND @CurrentMaxTransferSize >= 65537) OR @Version >= 15.0404316 OR SERVERPROPERTY('EngineEdition') = 8))) THEN ', COMPRESSION' ELSE ', NO_COMPRESSION' END
+			  END
+
+			  IF @CurrentBackupType = 'DIFF' SET @CurrentCommand += ', DIFFERENTIAL'
+
+			  IF EXISTS(SELECT * FROM @CurrentFiles WHERE Mirror = 1)
+			  BEGIN
+				SET @CurrentCommand += ', FORMAT'
+			  END
+
+			  IF @CopyOnly = 'Y' SET @CurrentCommand += ', COPY_ONLY'
+			  IF @NoRecovery = 'Y' AND @CurrentBackupType = 'LOG' SET @CurrentCommand += ', NORECOVERY'
+			  IF @Init = 'Y' SET @CurrentCommand += ', INIT'
+			  IF @Format = 'Y' SET @CurrentCommand += ', FORMAT'
+			  IF @BlockSize IS NOT NULL SET @CurrentCommand += ', BLOCKSIZE = ' + CAST(@BlockSize AS nvarchar)
+			  IF @BufferCount IS NOT NULL SET @CurrentCommand += ', BUFFERCOUNT = ' + CAST(@BufferCount AS nvarchar)
+			  IF @CurrentMaxTransferSize IS NOT NULL SET @CurrentCommand += ', MAXTRANSFERSIZE = ' + CAST(@CurrentMaxTransferSize AS nvarchar)
+			  IF @Description IS NOT NULL SET @CurrentCommand += ', DESCRIPTION = N''' + REPLACE(@Description,'''','''''') + ''''
+			  IF @Encrypt = 'Y' SET @CurrentCommand += ', ENCRYPTION (ALGORITHM = ' + UPPER(@EncryptionAlgorithm) + ', '
+			  IF @Encrypt = 'Y' AND @ServerCertificate IS NOT NULL SET @CurrentCommand += 'SERVER CERTIFICATE = ' + QUOTENAME(@ServerCertificate)
+			  IF @Encrypt = 'Y' AND @ServerAsymmetricKey IS NOT NULL SET @CurrentCommand += 'SERVER ASYMMETRIC KEY = ' + QUOTENAME(@ServerAsymmetricKey)
+			  IF @Encrypt = 'Y' SET @CurrentCommand += ')'
+			  IF @URL IS NOT NULL AND @Credential IS NOT NULL SET @CurrentCommand += ', CREDENTIAL = N''' + REPLACE(@Credential,'''','''''') + ''''
+		    END
         END
 
         IF @BackupSoftware = 'LITESPEED'
@@ -4134,7 +4254,7 @@ BEGIN
       END
 
       -- Verify the backup
-      IF @CurrentBackupOutput = 0 AND @Verify = 'Y'
+      IF @CurrentBackupOutput = 0 AND @Verify = 'Y' AND @AmazonRDS = 0
       BEGIN
         WHILE (1 = 1)
         BEGIN
@@ -4460,6 +4580,8 @@ BEGIN
   ----------------------------------------------------------------------------------------------------
 
 END
+GO
+
 GO
 SET ANSI_NULLS ON
 GO
@@ -8836,6 +8958,7 @@ BEGIN
   DECLARE @Version numeric(18,10) = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
   DECLARE @AmazonRDS bit = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
+  DECLARE @S3BucketArn nvarchar(255)
 
   IF @Version >= 14
   BEGIN
@@ -8887,6 +9010,10 @@ BEGIN
   SELECT @LogToTable = Value
   FROM #Config
   WHERE [Name] = 'LogToTable'
+  
+  SELECT @S3BucketArn = Value
+  FROM #Config
+  WHERE [Name] = 'S3BucketArn'
 
   SELECT @DatabaseName = Value
   FROM #Config
@@ -8929,14 +9056,14 @@ BEGIN
 
   INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
   SELECT 'DatabaseBackup - USER_DATABASES - DIFF',
-         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + '''' ELSE '' END + ',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
           @DatabaseName,
          'DatabaseBackup',
          'DIFF'
 
   INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
   SELECT 'DatabaseBackup - USER_DATABASES - FULL',
-         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + '''' ELSE '' END + ',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'DatabaseBackup',
          'FULL'
@@ -8962,7 +9089,7 @@ BEGIN
 
   INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
   SELECT 'IndexOptimize - USER_DATABASES',
-         'EXECUTE [dbo].[IndexOptimize]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         'EXECUTE [dbo].[IndexOptimize]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'IndexOptimize'
 
@@ -8988,12 +9115,63 @@ BEGIN
   SELECT 'Output File Cleanup',
          'cmd /q /c "For /F "tokens=1 delims=" %v In (''ForFiles /P "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '" /m *_*_*_*.txt /d -30 2^>^&1'') do if EXIST "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v echo del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v& del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v"',
          'OutputFileCleanup'
+  IF  @AmazonRDS = 1 
+  BEGIN
+  	  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+	  SELECT 'DatabaseBackup - Check RDS Backup Status',
+			 'DECLARE @RDSQueue TABLE ([task_id] INT,
+		[task_type] nvarchar(max),
+		[database_name] nvarchar(max),
+		[% complete] nvarchar(max),
+		[duration (mins)] nvarchar(max),
+		[lifecycle] nvarchar(max),
+		[task_info] nvarchar(max),
+		[last_updated] nvarchar(max),
+		[created_at] nvarchar(max),
+		[S3_object_arn] nvarchar(max),
+		[overwrite_s3_backup_file] nvarchar(max),
+		[KMS_master_key_arn] nvarchar(max),
+		[filepath] nvarchar(max),
+		[overwrite_file] BIT)
+
+	DECLARE @Message nvarchar(4000) = ''''
+
+	  INSERT INTO @RDSQueue exec msdb..rds_task_status 
+
+	  IF EXISTS( SELECT rbl.ID, rbl.task_id, rbl.[Status], rq.lifecycle
+			FROM [RDS_BackupLog] rbl
+			INNER JOIN @RDSQueue rq ON rbl.task_id = rq.task_id 
+			WHERE rq.lifecycle = ''ERROR'' AND rbl.[Status] <> rq.lifecycle )
+		SET @Message = ''RDS:Msg Errors Detected in RDS Backup Queue Status''
+
+	 select rq.task_id, rbl.ID , rq.[task_info] , rq.lifecycle INTO #tmp1
+	 FROM [RDS_BackupLog] rbl
+		 INNER JOIN @RDSQueue rq ON rbl.task_id = rq.task_id 
+	  WHERE rbl.[Status] NOT IN (''SUCCESS'',''ERROR'') 
+
+	  UPDATE CommandLog 
+	  SET CommandLog.ErrorNumber = 50000, CommandLog.ErrorMessage = #tmp1.[task_info]
+		 FROM  CommandLog cl
+		 INNER JOIN #tmp1 ON cl.ID = #tmp1.ID 
+	  WHERE #tmp1.lifecycle = ''ERROR''
+
+	  UPDATE [RDS_BackupLog] 
+	  SET [RDS_BackupLog].[Status] = rq.[lifecycle], [RDS_BackupLog].[task_info] = rq.[task_info]
+		FROM [RDS_BackupLog] 
+		INNER JOIN @RDSQueue rq ON [RDS_BackupLog].task_id = rq.task_id 
+	  WHERE [RDS_BackupLog].[Status] NOT IN (''SUCCESS'',''ERROR'') 
+
+	  IF @Message <> ''''
+		RAISERROR(''%s'',16,1,''RDS:Msg Errors Detected in RDS Backup Queue Status'') WITH LOG',
+		@DatabaseName,
+		'CheckRDSBackupStatus'
+  END
 
   IF @AmazonRDS = 1
   BEGIN
    UPDATE @Jobs
    SET Selected = 1
-   WHERE [Name] IN('DatabaseIntegrityCheck - USER_DATABASES','IndexOptimize - USER_DATABASES','CommandLog Cleanup')
+   WHERE [Name] IN('DatabaseIntegrityCheck - USER_DATABASES','IndexOptimize - USER_DATABASES','CommandLog Cleanup','DatabaseBackup - USER_DATABASES - FULL','DatabaseBackup - USER_DATABASES - DIFF','DatabaseBackup - Check RDS Backup Status')
   END
   ELSE IF SERVERPROPERTY('EngineEdition') = 8
   BEGIN
@@ -9072,6 +9250,11 @@ BEGIN
       IF LEN(@CurrentOutputFileName) > 200 SET @CurrentOutputFileName = NULL
     END
 
+    IF @AmazonRDS = 1
+	BEGIN
+	    SET @CurrentOutputFileName = NULL
+	END
+	
     IF @CurrentJobStepSubSystem IS NOT NULL AND @CurrentJobStepCommand IS NOT NULL AND NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @CurrentJobName)
     BEGIN
       EXECUTE msdb.dbo.sp_add_job @job_name = @CurrentJobName, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
