@@ -19,13 +19,10 @@ https://ola.hallengren.com
 
 Forked to support AWS RDS for SQL Server  
 	https://github.com/fill-e/sql-server-maintenance-solution   
-    Version: 2022-01-29        
+    Version: 2022-01-30 17:57:00        
 
 */
 
-IF NOT EXISTS (SELECT 1 FROM master.sys.databases WHERE Name = 'dba')
-	CREATE DATABASE [dba]
-GO
 	
 USE [dba] -- Specify the database in which the objects will be created.
 
@@ -36,7 +33,7 @@ DECLARE @BackupDirectory nvarchar(max)     = NULL        -- Specify the backup r
 DECLARE @CleanupTime int                   = NULL        -- Time in hours, after which backup files are deleted. If no time is specified, then no backup files are deleted.
 DECLARE @OutputFileDirectory nvarchar(max) = NULL        -- Specify the output file directory. If no directory is specified, then the SQL Server error log directory is used.
 DECLARE @LogToTable nvarchar(max)          = 'Y'         -- Log commands to a table.
-DECLARE @S3BucketArn nvarchar(255) = NULL                -- AWS S3 Bucket ARN value.
+DECLARE @S3BucketArn nvarchar(max) = ''                  -- AWS S3 Bucket ARN value.
 
 DECLARE @ErrorMessage nvarchar(max)
 
@@ -49,6 +46,12 @@ END
 IF NOT (SELECT [compatibility_level] FROM sys.databases WHERE database_id = DB_ID()) >= 90
 BEGIN
   SET @ErrorMessage = 'The database ' + QUOTENAME(DB_NAME(DB_ID())) + ' has to be in compatibility level 90 or higher.'
+  RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
+END
+
+IF ( DB_NAME() IN('master','rdsadmin') ) AND (DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa')
+BEGIN
+  SET @ErrorMessage = 'SQL Server Maintenance Solution cannot be installed in master or rdsadmin database'
   RAISERROR(@ErrorMessage,16,1) WITH NOWAIT
 END
 
@@ -95,22 +98,20 @@ CREATE TABLE [dbo].[CommandLog](
 )
 END
 GO
+
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[RDS_BackupLog]') AND type in (N'U'))
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[RDS_BackupLog]') AND type in (N'U')) AND EXISTS(SELECT DB_ID('rdsadmin')) AND SUSER_SNAME(0x01) = 'rdsa'
 BEGIN
-CREATE TABLE [dbo].[RDS_BackupLog](
+    CREATE TABLE [dbo].[RDS_BackupLog](
 	[ID] [int] NOT NULL,
 	[task_id] [int] NOT NULL,
 	[Status] [nvarchar](max) NULL,
 	[task_Info] [nvarchar](max) NULL,
-   CONSTRAINT [PK_RDS_BackupLog] PRIMARY KEY CLUSTERED 
-(
-	[ID] ASC, [task_id] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON)
-) 
+    CONSTRAINT [PK_RDS_BackupLog] PRIMARY KEY CLUSTERED 
+    ( [ID] ASC, [task_id] ASC ) WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ) 
 END
 GO
 SET ANSI_NULLS ON
@@ -732,7 +733,7 @@ BEGIN
   END
 
   DECLARE @AmazonRDS bit = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
-
+  
   ----------------------------------------------------------------------------------------------------
   --// Log initial information                                                                    //--
   ----------------------------------------------------------------------------------------------------
@@ -8958,7 +8959,7 @@ BEGIN
   DECLARE @Version numeric(18,10) = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
   DECLARE @AmazonRDS bit = CASE WHEN DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa' THEN 1 ELSE 0 END
-  DECLARE @S3BucketArn nvarchar(255)
+  DECLARE @S3BucketArn nvarchar(max)
 
   IF @Version >= 14
   BEGIN
@@ -9015,6 +9016,8 @@ BEGIN
   FROM #Config
   WHERE [Name] = 'S3BucketArn'
 
+  IF @S3BucketArn IS NULL SET @S3BucketArn = ''
+
   SELECT @DatabaseName = Value
   FROM #Config
   WHERE [Name] = 'DatabaseName'
@@ -9056,14 +9059,14 @@ BEGIN
 
   INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
   SELECT 'DatabaseBackup - USER_DATABASES - DIFF',
-         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + '''' ELSE '' END + ',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + ''',' ELSE '' END  + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
           @DatabaseName,
          'DatabaseBackup',
          'DIFF'
 
   INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
   SELECT 'DatabaseBackup - USER_DATABASES - FULL',
-         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + '''' ELSE '' END + ',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
+         'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin%' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CASE WHEN @AmazonRDS = 1 THEN CHAR(13) + CHAR(10) + '@S3BucketArn = ' + '''' + @S3BucketArn  + ''',' ELSE '' END  + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'DatabaseBackup',
          'FULL'
