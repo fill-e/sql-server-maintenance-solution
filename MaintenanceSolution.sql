@@ -19,7 +19,7 @@ https://ola.hallengren.com
 
 Forked to support AWS RDS for SQL Server  
 	https://github.com/fill-e/sql-server-maintenance-solution   
-    Version: 2022-01-30 17:57:00        
+    Version: 2022-01-31 16:45:00        
 
 */
 

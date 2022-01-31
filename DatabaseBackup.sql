@@ -69,7 +69,7 @@ ALTER PROCEDURE [dbo].[DatabaseBackup]
 @StringDelimiter nvarchar(max) = ',',
 @DatabaseOrder nvarchar(max) = NULL,
 @DatabasesInParallel nvarchar(max) = 'N',
-@S3BucketArn nvarchar(255) = NULL,
+@S3BucketArn nvarchar(max) = NULL,
 @LogToTable nvarchar(max) = 'N',
 @Execute nvarchar(max) = 'Y'					   
 
@@ -83,7 +83,7 @@ BEGIN
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
   --// Version: 2022-01-02 13:58:13                                                               //--
   --// Forked:  https://github.com/fill-e/sql-server-maintenance-solution                         //--
-  --// Version: 2022-01-29                                                                        //--
+  --// Version: 2022-01-31 16:45:00                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -262,7 +262,7 @@ BEGIN
   DECLARE @CurrentRDSBackupType nvarchar(20)
   DECLARE @CurrentRDSDatabaseFileName nvarchar(4000)
 
-  DECLARE @ServerName nvarchar(max) = CASE WHEN SERVERPROPERTY('EngineEdition') = 8 THEN LEFT(CAST(SERVERPROPERTY('ServerName') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ServerName') AS nvarchar(max))) - 1) ELSE CAST(SERVERPROPERTY('MachineName') AS nvarchar(max)) END											
+  DECLARE @ServerName nvarchar(max) = @@ServerName										
   
   IF @Version >= 14
   BEGIN
@@ -3521,13 +3521,15 @@ BEGIN
 
 			  IF @CurrentNumberOfFiles > 10 SET @CurrentNumberOfFiles = 10
 
-			  IF @CurrentAvailabilityGroup = Null 
+			  IF @CurrentNumberOfFiles > 1
+			    SELECT @CurrentDatabaseFileName=REPLACE(@CurrentDatabaseFileName,'_{FileNumber}','*'); 
+				
+			  IF @CurrentAvailabilityGroup IS NULL 
 			    SET @CurrentDatabaseFileName = @ServerName + '/' + @CurrentDatabaseFileName
 			  ELSE
 			    SET @CurrentDatabaseFileName = @ServerName + '/' + @CurrentAvailabilityGroup + '/' + @CurrentDatabaseFileName
 
-			  IF @CurrentNumberOfFiles > 1
-			    SELECT @CurrentDatabaseFileName=REPLACE(@CurrentDatabaseFileName,'_{FileNumber}','*'); 
+
 			 
 			  SET @CurrentCommand = 'EXEC msdb.dbo.rds_backup_database 	@source_db_name = ' + QUOTENAME(@CurrentDatabaseName) + ', @s3_arn_to_backup_to = ' + '''' + @S3BucketArn + '/' + @CurrentDatabaseFileName + '''' + ', @overwrite_s3_backup_file=1 ' + ', @type=' + '''' + @CurrentRDSBackupType + '''' + ', @number_of_files= ' + CAST(@CurrentNumberOfFiles AS VarChar(2)) + ';'
 	        END
